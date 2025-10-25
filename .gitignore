@@ -171,9 +171,12 @@ wandb/
 
 # Environment directories
 novelcreator-env/
+env/
 
 # Model files (large files)
 *.gguf
+model_cache/
+output/
 
 # Zip files
 *.zip
