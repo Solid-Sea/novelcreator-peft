@@ -165,6 +165,9 @@ output/
 # Data directories
 data/
 organized_novels/
+downloaded_model_final/
+dataset/
+wandb/
 
 # Environment directories
 novelcreator-env/
@@ -174,3 +177,18 @@ novelcreator-env/
 
 # Zip files
 *.zip
+
+# Security - sensitive configuration files
+config.yaml
+*.key
+*.pem
+*.p12
+*.pfx
+secrets/
+credentials/
+.secrets
+.credentials
+achieve
+
+# Temporary Docker files
+Dockerfile_*
