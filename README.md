@@ -14,11 +14,12 @@
 ## 文件结构
 
 ```
-qwen_finetune_pipeline/
+主目录/
 ├── train.py          # 主训练脚本
 ├── config.yaml       # 训练配置文件
 ├── test_train.py     # 功能测试脚本
 └── README.md         # 说明文档
+
 ```
 
 ## 安装依赖
