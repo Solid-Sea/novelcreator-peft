@@ -1,0 +1,40 @@
+# 示例配置文件：config_example.yaml
+model_name_or_path: "Qwen/Qwen2.5-7B-Instruct"
+dataset_path: "novel_finetuning_dataset.jsonl"
+output_dir: "output/qwen_qlora_model"
+resume_from_checkpoint: true
+
+quantization_config:
+  load_in_4bit: true
+  bnb_4bit_quant_type: "nf4"
+  bnb_4bit_compute_dtype: "bfloat16"
+  bnb_4bit_use_double_quant: true
+
+model_config:
+  trust_remote_code: true
+  torch_dtype: "bf16"           # 支持: bf16 / fp16 / fp32 / auto
+  device_map: "auto"
+  model_cache_dir: null
+  offload_folder: "./offload"   # 可选：当启用时，把部分参数卸载到磁盘
+  low_cpu_mem_usage: true        # 使用 transformers 的低内存加载（推荐用于内存受限环境）
+  use_init_empty_weights: false # 可选：使用 accelerate.init_empty_weights + load_checkpoint_and_dispatch（更激进）
+
+lora_config:
+  r: 32
+  lora_alpha: 64
+  lora_dropout: 0.1
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  bias: "none"
+
+training_args:
+  num_train_epochs: 3
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 2e-4
+  logging_steps: 10
+  save_steps: 100
+  save_total_limit: 3
+  bf16: true
+  gradient_checkpointing: true
+  use_8bit_optimizer: false    # 可选：若启用并且安装 bitsandbytes，会使用 8-bit 优化器以节省优化器内存
+  # 更多 TrainingArguments 字段参见 transformers 文档

@@ -23,6 +23,20 @@ import json
 import logging
 import yaml
 import torch
+import gc
+import importlib
+# 可选：使用 accelerate 的低内存加载辅助方法（init_empty_weights, load_checkpoint_and_dispatch）
+try:
+    from accelerate import init_empty_weights
+    try:
+        # 新版 accelerate 将 load_checkpoint_and_dispatch 放在 accelerate module
+        from accelerate import load_checkpoint_and_dispatch
+    except Exception:
+        # 老版可能在不同位置或不可用
+        load_checkpoint_and_dispatch = None
+except Exception:
+    init_empty_weights = None
+    load_checkpoint_and_dispatch = None
 from datasets import Dataset, load_dataset
 from transformers import (
     AutoModelForCausalLM,
@@ -41,6 +55,16 @@ from peft import (
 )
 from pathlib import Path
 import glob
+
+# 尝试按需导入 bitsandbytes 的 8-bit 优化器（如果可用）
+try:
+    from bitsandbytes.optim import Adam8bit  # newer versions may provide Adam8bit
+    AdamW8bit = Adam8bit
+except Exception:
+    try:
+        from bitsandbytes.optim import AdamW8bit
+    except Exception:
+        AdamW8bit = None
 
 # 配置日志
 logging.basicConfig(
@@ -207,19 +231,76 @@ def prepare_model_and_tokenizer(model_name_or_path: str, quantization_config, mo
         logger.info(f"设置 pad_token 为: {tokenizer.pad_token}")
     
     try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name_or_path,
-            quantization_config=quantization_config,
-            device_map=model_config.get('device_map', 'auto'),
-            trust_remote_code=model_config.get('trust_remote_code', True),
-            torch_dtype=model_config.get('torch_dtype', 'auto'),
-            cache_dir=model_cache_dir
-        )
+        # 处理 torch_dtype 字符串 -> torch.dtype
+        torch_dtype_cfg = model_config.get('torch_dtype', 'auto')
+        if isinstance(torch_dtype_cfg, str):
+            td = torch_dtype_cfg.lower()
+            if td in ('bfloat16', 'bf16'):
+                torch_dtype = torch.bfloat16
+            elif td in ('float16', 'fp16'):
+                torch_dtype = torch.float16
+            elif td in ('float32', 'fp32'):
+                torch_dtype = torch.float32
+            else:
+                torch_dtype = None
+        else:
+            torch_dtype = torch_dtype_cfg
+
+        # 支持可选的 offload_folder 以便在显存有限时将参数卸载到磁盘
+        offload_folder = model_config.get('offload_folder', None)
+
+        # low_cpu_mem_usage：transformers 提供的低内存加载选项
+        low_cpu_mem_usage = model_config.get('low_cpu_mem_usage', False)
+
+        # 若配置中启用了 accelerate 的 init_empty_weights 加载流程，则使用该流程来显著降低峰值内存
+        use_init_empty = model_config.get('use_init_empty_weights', False)
+        device_map = model_config.get('device_map', 'auto')
+
+        if use_init_empty and init_empty_weights is not None and load_checkpoint_and_dispatch is not None:
+            logger.info("使用 accelerate.init_empty_weights + load_checkpoint_and_dispatch 来低内存加载模型（可选）")
+            try:
+                from transformers import AutoConfig
+                with init_empty_weights():
+                    cfg = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=model_config.get('trust_remote_code', True), cache_dir=model_cache_dir)
+                    model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=model_config.get('trust_remote_code', True))
+
+                # 将权重加载并分配到设备（load_checkpoint_and_dispatch 接受 checkpoint 或模型 id）
+                load_checkpoint_and_dispatch(model, model_name_or_path, device_map=device_map, offload_folder=offload_folder)
+                logger.info("使用 accelerate 完成权重加载与分派")
+            except Exception as e:
+                logger.warning(f"使用 init_empty_weights + load_checkpoint_and_dispatch 失败，回退到标准 from_pretrained：{e}")
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name_or_path,
+                    quantization_config=quantization_config,
+                    device_map=device_map,
+                    trust_remote_code=model_config.get('trust_remote_code', True),
+                    torch_dtype=torch_dtype,
+                    cache_dir=model_cache_dir,
+                    offload_folder=offload_folder,
+                    low_cpu_mem_usage=low_cpu_mem_usage
+                )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name_or_path,
+                quantization_config=quantization_config,
+                device_map=device_map,
+                trust_remote_code=model_config.get('trust_remote_code', True),
+                torch_dtype=torch_dtype,
+                cache_dir=model_cache_dir,
+                offload_folder=offload_folder,
+                low_cpu_mem_usage=low_cpu_mem_usage
+            )
         logger.info("量化模型加载完成")
     except Exception as e:
         logger.error(f"加载量化模型失败: {e}")
         raise
     
+    # 关掉模型的 use_cache 以节省显存（在训练阶段通常不需要 cache）
+    try:
+        model.config.use_cache = False
+    except Exception:
+        pass
+
     model = prepare_model_for_kbit_training(model)
     logger.info("模型已准备好进行量化训练")
     
@@ -323,6 +404,8 @@ def main():
     training_args_config.setdefault('gradient_checkpointing', True)
     training_args_config.setdefault('logging_first_step', True)
     training_args_config['output_dir'] = output_dir
+    # 可选项：使用 8-bit 优化器以减少优化器状态内存占用（需要 bitsandbytes）
+    training_args_config.setdefault('use_8bit_optimizer', False)
     
     # 确保数值参数为正确的数据类型
     numeric_params = ['learning_rate', 'weight_decay', 'max_grad_norm', 'warmup_ratio']
@@ -388,15 +471,56 @@ def main():
         padding=True,
         pad_to_multiple_of=8
     )
+
+    # 如果配置要求使用 8-bit 优化器，尝试创建并将其传入 Trainer（否则让 Trainer 使用默认优化器）
+    use_8bit_opt = training_args_config.pop('use_8bit_optimizer', False)
+    optimizer_to_pass = None
+    if use_8bit_opt:
+        if AdamW8bit is None:
+            logger.warning("配置要求使用 8-bit 优化器，但 bitsandbytes 未安装或不支持 AdamW8bit，回退到默认优化器。")
+        else:
+            try:
+                # 只优化可训练参数（LoRA 的参数通常是 requires_grad=True）
+                trainable_params = [p for n, p in model.named_parameters() if p.requires_grad]
+                if len(trainable_params) == 0:
+                    logger.warning("未找到任何可训练参数以用于 8-bit 优化器，回退到默认优化器。")
+                else:
+                    lr = training_args_config.get('learning_rate', 2e-4)
+                    weight_decay = training_args_config.get('weight_decay', 0.0)
+                    optimizer_to_pass = AdamW8bit(trainable_params, lr=lr, weight_decay=weight_decay)
+                    logger.info("已创建 8-bit 优化器（bitsandbytes.AdamW8bit）以减小优化器内存占用。")
+            except Exception as e:
+                logger.warning(f"创建 8-bit 优化器失败，回退到默认优化器: {e}")
+
+    if optimizer_to_pass is not None:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=tokenized_dataset,
+            tokenizer=tokenizer,
+            data_collator=data_collator,
+            optimizers=(optimizer_to_pass, None)
+        )
+    else:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=tokenized_dataset,
+            tokenizer=tokenizer,
+            data_collator=data_collator,
+        )
     
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_dataset,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-    )
-    
+    # 在训练前尝试回收无用内存并清理 CUDA 缓存，以降低 OOM 风险
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
     logger.info("开始 QLoRA 训练...")
     trainer.train(resume_from_checkpoint=checkpoint_to_resume)
     

@@ -149,6 +149,16 @@ python3 ./src/train.py
 ```
 
 4) 监控训练进度
+### 新增的低内存与高级选项
+
+`src/train.py` 支持若干降低显存峰值的可选参数，推荐在显存受限或需要在较小 GPU 上训练时使用：
+
+- `model_config.low_cpu_mem_usage` (bool): 使用 transformers 的低内存加载（传递给 `from_pretrained(low_cpu_mem_usage=True)`）。
+- `model_config.offload_folder` (str): 指定一个磁盘目录用于参数卸载（配合 device_map='auto' 使用）。
+- `model_config.use_init_empty_weights` (bool): 更激进的低内存加载（基于 `accelerate.init_empty_weights` + `load_checkpoint_and_dispatch`），需要安装 `accelerate` 并且版本支持这些函数。若不可用，脚本会自动回退到标准加载。
+- `training_args.use_8bit_optimizer` (bool): 若启用且当前环境安装并支持 bitsandbytes 的 8-bit 优化器（AdamW8bit），训练会使用 8-bit 优化器来显著节省优化器状态内存。
+
+示例配置请见仓库根目录的 `config_example.yaml`。
 
 训练过程中会输出日志信息，包括：损失、学习率、检查点保存与训练进度等。你也可以结合 `scripts/` 中的脚本来包装运行或监控（例如在远程机器上使用 tmux / screen）。
 
