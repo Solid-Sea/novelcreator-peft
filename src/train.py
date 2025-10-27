@@ -4,17 +4,16 @@
 Qwen QLoRA 量化微调训练脚本
 功能：
 1. 从 ../config.yaml 读取训练配置
-2. 使用 BitsAndBytesConfig 进行4位量化加载 Qwen 模型
+2. 使用 Unsloth 高效加载 Qwen 模型
 3. 配置适合 Qwen 的 LoRA 参数
 4. 执行量化微调训练并保存模型
 
 依赖：
+- unsloth
 - transformers
-- peft
 - datasets
 - torch
 - accelerate
-- bitsandbytes
 - yaml
 """
 
@@ -25,6 +24,7 @@ import yaml
 import torch
 import gc
 import importlib
+from unsloth import FastLanguageModel
 # 可选：使用 accelerate 的低内存加载辅助方法（init_empty_weights, load_checkpoint_and_dispatch）
 try:
     from accelerate import init_empty_weights
@@ -39,19 +39,10 @@ except Exception:
     load_checkpoint_and_dispatch = None
 from datasets import Dataset, load_dataset
 from transformers import (
-    AutoModelForCausalLM,
     AutoTokenizer,
     TrainingArguments,
     Trainer,
     DataCollatorForSeq2Seq,
-    BitsAndBytesConfig
-)
-from peft import (
-    get_peft_model,
-    LoraConfig,
-    TaskType,
-    PeftModel,
-    prepare_model_for_kbit_training
 )
 from pathlib import Path
 import glob
@@ -85,30 +76,6 @@ def load_config():
     except Exception as e:
         logger.error(f"加载配置文件失败 {config_path}: {e}")
         raise
-
-
-def create_quantization_config(quant_config):
-    """创建量化配置"""
-    logger.info("正在创建量化配置...")
-    
-    # 处理计算数据类型
-    compute_dtype = quant_config.get('bnb_4bit_compute_dtype', 'bfloat16')
-    if compute_dtype == 'bfloat16':
-        compute_dtype = torch.bfloat16
-    elif compute_dtype == 'float16':
-        compute_dtype = torch.float16
-    else:
-        compute_dtype = torch.float32
-    
-    quantization_config = BitsAndBytesConfig(
-        load_in_4bit=quant_config.get('load_in_4bit', True),
-        bnb_4bit_quant_type=quant_config.get('bnb_4bit_quant_type', "nf4"),
-        bnb_4bit_compute_dtype=compute_dtype,
-        bnb_4bit_use_double_quant=quant_config.get('bnb_4bit_use_double_quant', True),
-    )
-    
-    logger.info(f"量化配置: {quantization_config}")
-    return quantization_config
 
 
 def load_and_prepare_dataset(dataset_path: str):
@@ -202,134 +169,22 @@ def preprocess_function_qwen(examples, tokenizer, max_length=2048):
     }
 
 
-def prepare_model_and_tokenizer(model_name_or_path: str, quantization_config, model_config):
-    """加载量化模型和 Tokenizer"""
-    logger.info(f"正在加载量化模型: {model_name_or_path}")
+def prepare_model_and_tokenizer(model_name_or_path: str, model_config):
+    """加载 Unsloth 优化后的模型和 Tokenizer"""
+    logger.info(f"正在使用 Unsloth 加载模型: {model_name_or_path}")
     
-    model_cache_dir = model_config.get("model_cache_dir")
-    if model_cache_dir:
-        logger.info(f"使用模型缓存目录: {model_cache_dir}")
-
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_name_or_path,
-            trust_remote_code=model_config.get('trust_remote_code', True),
-            use_fast=False,
-            cache_dir=model_cache_dir
-        )
-        logger.info("Tokenizer 加载完成")
-    except Exception as e:
-        logger.error(f"加载 Tokenizer 失败: {e}")
-        raise
-    
-    # 设置 pad_token
-    if tokenizer.pad_token is None:
-        if hasattr(tokenizer, 'eos_token') and tokenizer.eos_token:
-            tokenizer.pad_token = tokenizer.eos_token
-        else:
-            tokenizer.pad_token = tokenizer.unk_token
-        logger.info(f"设置 pad_token 为: {tokenizer.pad_token}")
-    
-    try:
-        # 处理 torch_dtype 字符串 -> torch.dtype
-        torch_dtype_cfg = model_config.get('torch_dtype', 'auto')
-        if isinstance(torch_dtype_cfg, str):
-            td = torch_dtype_cfg.lower()
-            if td in ('bfloat16', 'bf16'):
-                torch_dtype = torch.bfloat16
-            elif td in ('float16', 'fp16'):
-                torch_dtype = torch.float16
-            elif td in ('float32', 'fp32'):
-                torch_dtype = torch.float32
-            else:
-                torch_dtype = None
-        else:
-            torch_dtype = torch_dtype_cfg
-
-        # 支持可选的 offload_folder 以便在显存有限时将参数卸载到磁盘
-        offload_folder = model_config.get('offload_folder', None)
-
-        # low_cpu_mem_usage：transformers 提供的低内存加载选项
-        low_cpu_mem_usage = model_config.get('low_cpu_mem_usage', False)
-
-        # 若配置中启用了 accelerate 的 init_empty_weights 加载流程，则使用该流程来显著降低峰值内存
-        use_init_empty = model_config.get('use_init_empty_weights', False)
-        device_map = model_config.get('device_map', 'auto')
-
-        if use_init_empty and init_empty_weights is not None and load_checkpoint_and_dispatch is not None:
-            logger.info("使用 accelerate.init_empty_weights + load_checkpoint_and_dispatch 来低内存加载模型（可选）")
-            try:
-                from transformers import AutoConfig
-                with init_empty_weights():
-                    cfg = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=model_config.get('trust_remote_code', True), cache_dir=model_cache_dir)
-                    model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=model_config.get('trust_remote_code', True))
-
-                # 将权重加载并分配到设备（load_checkpoint_and_dispatch 接受 checkpoint 或模型 id）
-                load_checkpoint_and_dispatch(model, model_name_or_path, device_map=device_map, offload_folder=offload_folder)
-                logger.info("使用 accelerate 完成权重加载与分派")
-            except Exception as e:
-                logger.warning(f"使用 init_empty_weights + load_checkpoint_and_dispatch 失败，回退到标准 from_pretrained：{e}")
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_name_or_path,
-                    quantization_config=quantization_config,
-                    device_map=device_map,
-                    trust_remote_code=model_config.get('trust_remote_code', True),
-                    torch_dtype=torch_dtype,
-                    cache_dir=model_cache_dir,
-                    offload_folder=offload_folder,
-                    low_cpu_mem_usage=low_cpu_mem_usage
-                )
-        else:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name_or_path,
-                quantization_config=quantization_config,
-                device_map=device_map,
-                trust_remote_code=model_config.get('trust_remote_code', True),
-                torch_dtype=torch_dtype,
-                cache_dir=model_cache_dir,
-                offload_folder=offload_folder,
-                low_cpu_mem_usage=low_cpu_mem_usage
-            )
-        logger.info("量化模型加载完成")
-    except Exception as e:
-        logger.error(f"加载量化模型失败: {e}")
-        raise
-    
-    # 关掉模型的 use_cache 以节省显存（在训练阶段通常不需要 cache）
-    try:
-        model.config.use_cache = False
-    except Exception:
-        pass
-
-    model = prepare_model_for_kbit_training(model)
-    logger.info("模型已准备好进行量化训练")
-    
-    return model, tokenizer
-
-
-def setup_lora_model(model, lora_config):
-    """配置 LoRA 微调（适配 Qwen）"""
-    logger.info("正在配置 LoRA（Qwen 适配）...")
-    
-    peft_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-        r=lora_config.get('r', 32),
-        lora_alpha=lora_config.get('lora_alpha', 64),
-        lora_dropout=lora_config.get('lora_dropout', 0.1),
-        target_modules=lora_config.get('target_modules', ["q_proj", "k_proj", "v_proj", "o_proj"]),
-        bias=lora_config.get('bias', "none")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_name_or_path,
+        max_seq_length=model_config.get('max_length', 2048),
+        dtype=torch.bfloat16,
+        load_in_4bit=True,
     )
     
-    model = get_peft_model(model, peft_config)
-    model.print_trainable_parameters()
+    logger.info("Unsloth 模型和 Tokenizer 加载完成")
     
-    for name, param in model.named_parameters():
-        if 'lora_' in name:
-            param.requires_grad = True
+    # Unsloth 模型默认已准备好训练，无需额外操作
     
-    logger.info("LoRA 配置完成（Qwen 适配）")
-    return model
+    return model, tokenizer
 
 
 def find_latest_checkpoint(output_dir: str) -> str:
@@ -357,13 +212,6 @@ def main():
     output_dir = config.get('output_dir', 'output/qwen_qlora_model')
     resume_from_checkpoint = config.get('resume_from_checkpoint', True)
     
-    quantization_config_dict = config.get('quantization_config', {
-        'load_in_4bit': True,
-        'bnb_4bit_quant_type': "nf4",
-        'bnb_4bit_compute_dtype': "bfloat16",
-        'bnb_4bit_use_double_quant': True
-    })
-    
     model_config = config.get('model_config', {
         'trust_remote_code': True,
         'torch_dtype': 'auto',
@@ -372,10 +220,10 @@ def main():
     })
     
     lora_config = config.get('lora_config', {
-        'r': 32,
-        'lora_alpha': 64,
+        'r': 8,
+        'lora_alpha': 16,
         'lora_dropout': 0.1,
-        'target_modules': ["q_proj", "k_proj", "v_proj", "o_proj"],
+        'target_modules': ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         'bias': "none"
     })
     
@@ -441,8 +289,7 @@ def main():
         else:
             logger.info("未找到检查点，将从头开始训练")
     
-    quantization_config = create_quantization_config(quantization_config_dict)
-    model, tokenizer = prepare_model_and_tokenizer(model_name_or_path, quantization_config, model_config)
+    model, tokenizer = prepare_model_and_tokenizer(model_name_or_path, model_config)
     dataset = load_and_prepare_dataset(dataset_path)
     
     logger.info("正在预处理数据集（Qwen 格式）...")
@@ -455,7 +302,15 @@ def main():
     
     logger.info(f"数据集预处理完成，样本数: {len(tokenized_dataset)}")
     
-    model = setup_lora_model(model, lora_config)
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=lora_config.get('r', 8),
+        lora_alpha=lora_config.get('lora_alpha', 16),
+        lora_dropout=lora_config.get('lora_dropout', 0.1),
+        target_modules=lora_config.get('target_modules', ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]),
+        bias=lora_config.get('bias', "none"),
+        task_type="CAUSAL_LM",
+    )
     
     if training_args_config.get('gradient_checkpointing', False):
         model.gradient_checkpointing_enable()
@@ -535,7 +390,6 @@ def main():
         json.dump({
             'model_name_or_path': model_name_or_path,
             'dataset_path': dataset_path,
-            'quantization_config': quantization_config_dict,
             'lora_config': lora_config,
             'training_args': training_args_config,
             'model_config': model_config
