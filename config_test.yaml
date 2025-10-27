@@ -14,6 +14,7 @@ model_config:
   device_map: "auto"
   max_length: 1024
   model_cache_dir: "./model_cache"
+  local_model_path: null
 
 # LoRA 配置（低秩适应微调）
 lora_config:

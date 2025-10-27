@@ -171,13 +171,21 @@ def preprocess_function_qwen(examples, tokenizer, max_length=2048):
 
 def prepare_model_and_tokenizer(model_name_or_path: str, model_config):
     """加载 Unsloth 优化后的模型和 Tokenizer"""
-    logger.info(f"正在使用 Unsloth 加载模型: {model_name_or_path}")
+    # 决定加载路径
+    local_path = model_config.get("local_model_path")
+    model_to_load = local_path if local_path else model_name_or_path
+    local_files_only_flag = True if local_path else False
+
+    logger.info(f"正在从 '{model_to_load}' 加载模型...")
+    if local_files_only_flag:
+        logger.info("模式: 仅使用本地文件。")
     
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_name_or_path,
+        model_name=model_to_load,
         max_seq_length=model_config.get('max_length', 2048),
         dtype=torch.bfloat16,
         load_in_4bit=True,
+        local_files_only=local_files_only_flag, # <-- 添加此参数
     )
     
     logger.info("Unsloth 模型和 Tokenizer 加载完成")
