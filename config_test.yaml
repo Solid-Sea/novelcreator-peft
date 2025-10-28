@@ -20,6 +20,7 @@ model_config:
   # false (默认): 从 model_name_or_path 指定的 Hub 仓库加载或使用缓存。
   # true: 必须从 local_model_path 加载，如果路径无效则会报错。
   force_local_load: false
+  dtype: "float16"
 
 # LoRA 配置（低秩适应微调）
 lora_config:

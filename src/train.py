@@ -232,11 +232,16 @@ def prepare_model_and_tokenizer(model_name_or_path, model_config):
         if cache_dir:
             print(f"使用缓存目录: {cache_dir}")
 
+    # 动态获取并转换 dtype
+    dtype_str = model_config.get("dtype", "float16")
+    model_dtype = getattr(torch, dtype_str, torch.float16)
+    print(f"模型将使用数据类型: {model_dtype}")
+
     # 调用 Unsloth 加载函数
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_to_load,
         max_seq_length=model_config.get('max_length', 2048),
-        dtype=torch.bfloat16,
+        dtype=model_dtype,
         load_in_4bit=True,
         local_files_only=local_files_only_flag,
         cache_dir=cache_dir,
