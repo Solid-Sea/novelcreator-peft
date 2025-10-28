@@ -15,6 +15,11 @@ model_config:
   max_length: 1024
   model_cache_dir: "./model_cache"
   local_model_path: null
+  
+  # 新增：是否强制从 local_model_path 加载模型
+  # false (默认): 从 model_name_or_path 指定的 Hub 仓库加载或使用缓存。
+  # true: 必须从 local_model_path 加载，如果路径无效则会报错。
+  force_local_load: false
 
 # LoRA 配置（低秩适应微调）
 lora_config:

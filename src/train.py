@@ -201,33 +201,48 @@ def preprocess_function_qwen(examples, tokenizer, max_length=2048):
     }
 
 
-def prepare_model_and_tokenizer(model_name_or_path: str, model_config):
-    """加载 Unsloth 优化后的模型和 Tokenizer"""
-    # 决定加载路径
-    local_path = model_config.get("local_model_path")
-    model_to_load = local_path if local_path else model_name_or_path
-    local_files_only_flag = True if local_path else False
+def prepare_model_and_tokenizer(model_name_or_path, model_config):
+    """
+    加载 Unsloth 优化后的模型和 Tokenizer（新版可靠逻辑）
+    """
+    force_local_load = model_config.get("force_local_load", False)
+    local_model_path = model_config.get("local_model_path")
     cache_dir = model_config.get("model_cache_dir")
 
-    logger.info(f"正在从 '{model_to_load}' 加载模型...")
-    if local_files_only_flag:
-        logger.info("模式: 仅使用本地文件。")
-    if cache_dir:
-        logger.info(f"使用缓存目录: {cache_dir}")
+    model_to_load = model_name_or_path
+    local_files_only_flag = False
     
+    if force_local_load:
+        print("模式: 强制本地加载已启用。")
+        if not local_model_path or not os.path.isdir(local_model_path):
+            raise ValueError(
+                f"强制本地加载失败：当 'force_local_load' 为 true 时, 'local_model_path' "
+                f"必须被设置并且是一个有效的目录, 但当前值为: '{local_model_path}'"
+            )
+        
+        model_to_load = local_model_path
+        local_files_only_flag = True
+        # 在纯本地加载模式下，我们不应依赖 Hugging Face 的缓存目录，以避免行为混淆
+        cache_dir = None
+        print(f"将严格从本地路径加载模型: {model_to_load}")
+
+    else:
+        print("模式: 将从 Hugging Face Hub 或缓存加载。")
+        print(f"模型标识: {model_to_load}")
+        if cache_dir:
+            print(f"使用缓存目录: {cache_dir}")
+
+    # 调用 Unsloth 加载函数
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_to_load,
         max_seq_length=model_config.get('max_length', 2048),
         dtype=torch.bfloat16,
         load_in_4bit=True,
-        local_files_only=local_files_only_flag, # <-- 添加此参数
+        local_files_only=local_files_only_flag,
         cache_dir=cache_dir,
     )
     
-    logger.info("Unsloth 模型和 Tokenizer 加载完成")
-    
-    # Unsloth 模型默认已准备好训练，无需额外操作
-    
+    print("Unsloth 模型和 Tokenizer 加载完成。")
     return model, tokenizer
 
 
