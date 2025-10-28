@@ -46,6 +46,7 @@ from transformers import (
 )
 from pathlib import Path
 import glob
+import argparse
 
 # 尝试按需导入 bitsandbytes 的 8-bit 优化器（如果可用）
 try:
@@ -64,10 +65,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# 针对 Windows 平台的 Unsloth 兼容性补丁
+import platform
+if platform.system() == "Windows":
+    try:
+        import unsloth_zoo.rl_environments
+        from contextlib import contextmanager
 
-def load_config():
+        @contextmanager
+        def dummy_time_limit(seconds):
+            yield
+
+        unsloth_zoo.rl_environments.time_limit = dummy_time_limit
+        logger.info("Applied Windows compatibility patch for Unsloth's time_limit function.")
+    except (ImportError, AttributeError) as e:
+        logger.warning(f"Could not apply Unsloth Windows patch, continuing without it. Error: {e}")
+
+# 针对 Unsloth 内部 ZeroDivisionError 的补丁
+try:
+    from unsloth_zoo.fused_losses import cross_entropy_loss as ce_loss
+    original_get_chunk_multiplier = ce_loss._get_chunk_multiplier
+
+    def patched_get_chunk_multiplier(vocab_size, target_gb):
+        if target_gb is None or target_gb == 0:
+            target_gb = 0.2  # 使用一个安全的默认值避免除零
+        # 直接重新实现原始逻辑，而不是再次调用它
+        return (vocab_size * 4 / 1024 / 1024 / 1024) / target_gb
+
+    ce_loss._get_chunk_multiplier = patched_get_chunk_multiplier
+    logger.info("Applied patch for Unsloth's _get_chunk_multiplier to prevent ZeroDivisionError.")
+except (ImportError, AttributeError) as e:
+    logger.warning(f"Could not apply Unsloth _get_chunk_multiplier patch, continuing without it. Error: {e}")
+
+
+def load_config(config_path: str):
     """加载配置文件"""
-    config_path = os.path.join(os.path.dirname(__file__), "../config.yaml")
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
@@ -175,10 +207,13 @@ def prepare_model_and_tokenizer(model_name_or_path: str, model_config):
     local_path = model_config.get("local_model_path")
     model_to_load = local_path if local_path else model_name_or_path
     local_files_only_flag = True if local_path else False
+    cache_dir = model_config.get("model_cache_dir")
 
     logger.info(f"正在从 '{model_to_load}' 加载模型...")
     if local_files_only_flag:
         logger.info("模式: 仅使用本地文件。")
+    if cache_dir:
+        logger.info(f"使用缓存目录: {cache_dir}")
     
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_to_load,
@@ -186,6 +221,7 @@ def prepare_model_and_tokenizer(model_name_or_path: str, model_config):
         dtype=torch.bfloat16,
         load_in_4bit=True,
         local_files_only=local_files_only_flag, # <-- 添加此参数
+        cache_dir=cache_dir,
     )
     
     logger.info("Unsloth 模型和 Tokenizer 加载完成")
@@ -211,9 +247,18 @@ def find_latest_checkpoint(output_dir: str) -> str:
 
 def main():
     """主函数"""
+    parser = argparse.ArgumentParser(description="Qwen QLoRA 量化微调训练脚本")
+    parser.add_argument(
+        '--config',
+        type=str,
+        default=os.path.join(os.path.dirname(__file__), "../config.yaml"),
+        help='配置文件的路径'
+    )
+    args = parser.parse_args()
+
     logger.info("开始 Qwen QLoRA 量化微调训练...")
     
-    config = load_config()
+    config = load_config(args.config)
     
     model_name_or_path = config.get('model_name_or_path', 'Qwen/Qwen2.5-7B-Instruct')
     dataset_path = config.get('dataset_path', 'dataset/novel_finetuning_dataset.jsonl')
@@ -317,7 +362,6 @@ def main():
         lora_dropout=lora_config.get('lora_dropout', 0.1),
         target_modules=lora_config.get('target_modules', ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]),
         bias=lora_config.get('bias', "none"),
-        task_type="CAUSAL_LM",
     )
     
     if training_args_config.get('gradient_checkpointing', False):
@@ -326,6 +370,8 @@ def main():
             model.enable_input_require_grads()
         logger.info("已启用梯度检查点")
     
+    # 如果配置要求使用 8-bit 优化器，尝试创建并将其传入 Trainer（否则让 Trainer 使用默认优化器）
+    use_8bit_opt = training_args_config.pop('use_8bit_optimizer', False)
     training_args = TrainingArguments(**training_args_config)
     
     data_collator = DataCollatorForSeq2Seq(
@@ -335,8 +381,6 @@ def main():
         pad_to_multiple_of=8
     )
 
-    # 如果配置要求使用 8-bit 优化器，尝试创建并将其传入 Trainer（否则让 Trainer 使用默认优化器）
-    use_8bit_opt = training_args_config.pop('use_8bit_optimizer', False)
     optimizer_to_pass = None
     if use_8bit_opt:
         if AdamW8bit is None:

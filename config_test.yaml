@@ -3,7 +3,7 @@
 
 # 基础配置
 model_name_or_path: "Qwen/Qwen2.5-7B-Instruct"  # 基础模型路径
-dataset_path: "../dataset/novel_finetuning_dataset.jsonl"  # 数据集路径（相对于项目根目录）
+dataset_path: "novel_finetuning_dataset.jsonl"  # 数据集路径（相对于项目根目录）
 output_dir: "output/qwen_qlora_model"  # 输出目录
 resume_from_checkpoint: true  # 是否从检查点恢复训练
 
@@ -41,7 +41,7 @@ training_args:
   weight_decay: 0.01
   
   # 优化器和调度器
-  optim: "paged_adamw_8bit"
+  optim: "adamw_torch"
   lr_scheduler_type: "cosine"
   warmup_steps: 50
   max_grad_norm: 1.0
@@ -63,6 +63,6 @@ training_args:
   bf16: true  # 使用 bfloat16 精度
   
   # 其他设置
-  report_to: null  # 不使用 wandb 等日志工具
+  report_to: "all"  # 恢复 wandb 等日志工具
   overwrite_output_dir: false
   push_to_hub: false
